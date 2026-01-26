@@ -1,0 +1,658 @@
+/*
+ * ESP32 HMI Firmware for Elecrow 2.8" ESP32-HMI-320x240
+ * Dual Motor Control Interface with CAN Communication
+ * 
+ * Hardware:
+ * - Elecrow ESP32-HMI-320x240 (ESP32-WROOM-32)
+ * - 2.8" TFT LCD (320x240, ILI9341 or ST7789)
+ * - CAN Transceiver (MCP2515 or SN65HVD230)
+ * - Dual Motor Controllers (ODrive or similar with CAN interface)
+ * 
+ * Features:
+ * - Touch screen interface for motor control
+ * - Real-time position/velocity/torque display
+ * - Synchronized dual motor operation
+ * - CAN bus communication with motor controllers
+ * - Serial communication with PC application
+ * - Error monitoring and display
+ */
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <TFT_eSPI.h>
+#include <ESP32CAN.h>
+#include <CAN_config.h>
+
+// ===========================
+// Pin Definitions (Elecrow 2.8" ESP32-HMI)
+// ===========================
+#define TFT_CS    15
+#define TFT_DC    2
+#define TFT_RST   4
+#define TFT_MOSI  23
+#define TFT_MISO  19
+#define TFT_SCK   18
+#define TFT_LED   27  // Backlight control
+
+// Touch screen pins (if using XPT2046)
+#define TOUCH_CS  14
+#define TOUCH_IRQ 26
+
+// CAN Bus pins
+#define CAN_TX    5
+#define CAN_RX    35
+
+// ===========================
+// Constants
+// ===========================
+#define SCREEN_WIDTH  320
+#define SCREEN_HEIGHT 240
+#define SERIAL_BAUD   115200
+#define CAN_SPEED     CAN_SPEED_250KBPS
+
+// Motor Axis IDs
+#define MOTOR_AXIS_0  0x02
+#define MOTOR_AXIS_1  0x03
+
+// CAN Command IDs
+#define CMD_GET_MOTOR_ERROR      0x03
+#define CMD_GET_ENCODER_ERROR    0x04
+#define CMD_SET_AXIS_STATE       0x07
+#define CMD_GET_ENCODER_EST      0x09
+#define CMD_SET_CONTROLLER_MODE  0x0B
+#define CMD_SET_INPUT_POS        0x0C
+#define CMD_SET_INPUT_VEL        0x0D
+#define CMD_SET_INPUT_TORQUE     0x0E
+#define CMD_GET_IQ_MEASURED      0x14
+#define CMD_GET_VBUS_VOLTAGE     0x17
+#define CMD_CLEAR_ERROR          0x18
+
+// Motor States
+#define AXIS_STATE_IDLE                 1
+#define AXIS_STATE_CLOSED_LOOP_CONTROL  8
+
+// Control Modes
+#define CONTROL_MODE_VOLTAGE       0
+#define CONTROL_MODE_TORQUE        1
+#define CONTROL_MODE_VELOCITY      2
+#define CONTROL_MODE_POSITION      3
+
+// UI Update Intervals
+#define UI_UPDATE_INTERVAL       100   // ms
+#define CAN_UPDATE_INTERVAL      50    // ms
+#define TELEMETRY_INTERVAL       200   // ms
+
+// ===========================
+// Global Variables
+// ===========================
+TFT_eSPI tft = TFT_eSPI();
+CAN_device_t CAN_cfg;
+
+// Motor State
+struct MotorState {
+  float position;
+  float velocity;
+  float current;
+  float voltage;
+  uint32_t error;
+  uint8_t axisState;
+  uint8_t controlMode;
+  bool isReady;
+  bool isSynced;
+};
+
+MotorState motor0 = {0};
+MotorState motor1 = {0};
+
+// Synchronization
+bool synchronizedMode = false;
+bool motorsEnabled = false;
+bool emergencyStop = false;
+
+// UI State
+enum UIScreen {
+  SCREEN_MAIN,
+  SCREEN_MOTOR_CONTROL,
+  SCREEN_DIAGNOSTICS,
+  SCREEN_SETTINGS
+};
+
+UIScreen currentScreen = SCREEN_MAIN;
+uint32_t lastUIUpdate = 0;
+uint32_t lastCANUpdate = 0;
+uint32_t lastTelemetryUpdate = 0;
+
+// Touch state
+bool screenTouched = false;
+int touchX = 0, touchY = 0;
+
+// ===========================
+// CAN Communication Functions
+// ===========================
+
+/**
+ * Send CAN message to motor controller
+ */
+bool sendCANCommand(uint8_t motorAxis, uint8_t cmd, float value = 0.0f) {
+  CAN_frame_t tx_frame;
+  tx_frame.FIR.B.FF = CAN_frame_std;
+  tx_frame.FIR.B.DLC = 8;
+  tx_frame.MsgID = (cmd << 5) | motorAxis;
+  
+  // Convert float to bytes (little endian)
+  uint8_t* bytes = (uint8_t*)&value;
+  for (int i = 0; i < 4; i++) {
+    tx_frame.data.u8[i] = bytes[i];
+  }
+  for (int i = 4; i < 8; i++) {
+    tx_frame.data.u8[i] = 0;
+  }
+  
+  int result = ESP32Can.CANWriteFrame(&tx_frame);
+  return (result == 1);
+}
+
+/**
+ * Request telemetry from motor
+ */
+void requestMotorTelemetry(uint8_t motorAxis) {
+  sendCANCommand(motorAxis, CMD_GET_ENCODER_EST);
+  delay(5);
+  sendCANCommand(motorAxis, CMD_GET_IQ_MEASURED);
+  delay(5);
+  sendCANCommand(motorAxis, CMD_GET_VBUS_VOLTAGE);
+}
+
+/**
+ * Process incoming CAN messages
+ */
+void processCANMessages() {
+  CAN_frame_t rx_frame;
+  
+  while (ESP32Can.CANReadFrame(&rx_frame) == 1) {
+    uint8_t cmd = (rx_frame.MsgID >> 5) & 0x1F;
+    uint8_t axis = rx_frame.MsgID & 0x1F;
+    
+    MotorState* motor = (axis == MOTOR_AXIS_0) ? &motor0 : &motor1;
+    
+    // Parse float value from CAN data
+    float value;
+    memcpy(&value, rx_frame.data.u8, sizeof(float));
+    
+    switch (cmd) {
+      case CMD_GET_ENCODER_EST:
+        motor->position = value;
+        motor->isReady = true;
+        break;
+        
+      case CMD_GET_IQ_MEASURED:
+        motor->current = value;
+        break;
+        
+      case CMD_GET_VBUS_VOLTAGE:
+        motor->voltage = value;
+        break;
+        
+      case CMD_GET_MOTOR_ERROR:
+      case CMD_GET_ENCODER_ERROR:
+        motor->error = *((uint32_t*)rx_frame.data.u8);
+        if (motor->error != 0) {
+          emergencyStop = true;
+          motorsEnabled = false;
+        }
+        break;
+    }
+  }
+}
+
+/**
+ * Set motor axis state (idle, calibration, closed-loop)
+ */
+void setMotorAxisState(uint8_t motorAxis, uint8_t state) {
+  sendCANCommand(motorAxis, CMD_SET_AXIS_STATE, (float)state);
+}
+
+/**
+ * Set motor control mode
+ */
+void setMotorControlMode(uint8_t motorAxis, uint8_t mode) {
+  sendCANCommand(motorAxis, CMD_SET_CONTROLLER_MODE, (float)mode);
+}
+
+/**
+ * Set motor velocity
+ */
+void setMotorVelocity(uint8_t motorAxis, float velocity) {
+  sendCANCommand(motorAxis, CMD_SET_INPUT_VEL, velocity);
+}
+
+/**
+ * Set motor position
+ */
+void setMotorPosition(uint8_t motorAxis, float position) {
+  sendCANCommand(motorAxis, CMD_SET_INPUT_POS, position);
+}
+
+/**
+ * Set motor torque
+ */
+void setMotorTorque(uint8_t motorAxis, float torque) {
+  sendCANCommand(motorAxis, CMD_SET_INPUT_TORQUE, torque);
+}
+
+/**
+ * Clear motor errors
+ */
+void clearMotorErrors() {
+  sendCANCommand(MOTOR_AXIS_0, CMD_CLEAR_ERROR);
+  delay(10);
+  sendCANCommand(MOTOR_AXIS_1, CMD_CLEAR_ERROR);
+  motor0.error = 0;
+  motor1.error = 0;
+  emergencyStop = false;
+}
+
+/**
+ * Enable both motors in synchronized mode
+ */
+void enableSynchronizedMotors() {
+  if (synchronizedMode) {
+    // Start both motors simultaneously
+    setMotorAxisState(MOTOR_AXIS_0, AXIS_STATE_CLOSED_LOOP_CONTROL);
+    setMotorAxisState(MOTOR_AXIS_1, AXIS_STATE_CLOSED_LOOP_CONTROL);
+    motorsEnabled = true;
+  }
+}
+
+/**
+ * Disable both motors
+ */
+void disableMotors() {
+  setMotorAxisState(MOTOR_AXIS_0, AXIS_STATE_IDLE);
+  setMotorAxisState(MOTOR_AXIS_1, AXIS_STATE_IDLE);
+  motorsEnabled = false;
+}
+
+/**
+ * Emergency stop - immediately stop both motors
+ */
+void executeEmergencyStop() {
+  disableMotors();
+  setMotorVelocity(MOTOR_AXIS_0, 0.0f);
+  setMotorVelocity(MOTOR_AXIS_1, 0.0f);
+  emergencyStop = true;
+  motorsEnabled = false;
+}
+
+// ===========================
+// UI Drawing Functions
+// ===========================
+
+/**
+ * Draw button on screen
+ */
+void drawButton(int x, int y, int w, int h, const char* label, uint16_t color, bool pressed = false) {
+  uint16_t bgColor = pressed ? TFT_DARKGREY : color;
+  uint16_t textColor = TFT_WHITE;
+  
+  tft.fillRoundRect(x, y, w, h, 5, bgColor);
+  tft.drawRoundRect(x, y, w, h, 5, TFT_WHITE);
+  
+  tft.setTextColor(textColor);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString(label, x + w/2, y + h/2);
+}
+
+/**
+ * Draw motor status panel
+ */
+void drawMotorStatus(int x, int y, const char* label, MotorState* motor) {
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextDatum(TL_DATUM);
+  
+  // Title
+  tft.setTextSize(1);
+  tft.drawString(label, x, y);
+  
+  // Status indicator
+  uint16_t statusColor = motor->isReady ? TFT_GREEN : TFT_RED;
+  if (motor->error != 0) statusColor = TFT_RED;
+  tft.fillCircle(x + 80, y + 5, 6, statusColor);
+  
+  y += 20;
+  
+  // Position
+  tft.drawString("Pos:", x, y);
+  tft.drawString(String(motor->position, 2), x + 50, y);
+  y += 15;
+  
+  // Velocity
+  tft.drawString("Vel:", x, y);
+  tft.drawString(String(motor->velocity, 2), x + 50, y);
+  y += 15;
+  
+  // Current
+  tft.drawString("Cur:", x, y);
+  tft.drawString(String(motor->current, 2) + "A", x + 50, y);
+  y += 15;
+  
+  // Voltage
+  tft.drawString("Vdc:", x, y);
+  tft.drawString(String(motor->voltage, 1) + "V", x + 50, y);
+}
+
+/**
+ * Draw main screen
+ */
+void drawMainScreen() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.setTextDatum(TC_DATUM);
+  tft.drawString("DUAL MOTOR HMI", SCREEN_WIDTH/2, 10);
+  
+  // Motor status panels
+  tft.drawRect(10, 40, 140, 110, TFT_WHITE);
+  drawMotorStatus(15, 45, "Motor 0", &motor0);
+  
+  tft.drawRect(170, 40, 140, 110, TFT_WHITE);
+  drawMotorStatus(175, 45, "Motor 1", &motor1);
+  
+  // Sync mode indicator
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextDatum(TL_DATUM);
+  tft.drawString("Sync Mode:", 10, 160);
+  tft.fillCircle(90, 165, 8, synchronizedMode ? TFT_GREEN : TFT_DARKGREY);
+  
+  // Control buttons
+  uint16_t enableColor = motorsEnabled ? TFT_GREEN : TFT_DARKGREEN;
+  drawButton(10, 180, 80, 40, motorsEnabled ? "STOP" : "START", enableColor);
+  
+  drawButton(100, 180, 80, 40, "SYNC", synchronizedMode ? TFT_BLUE : TFT_DARKGREY);
+  
+  drawButton(190, 180, 120, 40, "E-STOP", emergencyStop ? TFT_RED : TFT_DARKGREY);
+  
+  // Error display
+  if (motor0.error != 0 || motor1.error != 0) {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.setTextDatum(BC_DATUM);
+    tft.drawString("ERROR DETECTED!", SCREEN_WIDTH/2, SCREEN_HEIGHT - 5);
+  }
+}
+
+/**
+ * Update display with latest data
+ */
+void updateDisplay() {
+  if (millis() - lastUIUpdate < UI_UPDATE_INTERVAL) return;
+  lastUIUpdate = millis();
+  
+  switch (currentScreen) {
+    case SCREEN_MAIN:
+      drawMainScreen();
+      break;
+    // Add other screens as needed
+  }
+}
+
+// ===========================
+// Touch Input Handling
+// ===========================
+
+/**
+ * Check for touch input
+ */
+bool checkTouch(int &x, int &y) {
+  // Simple touch detection (adjust for your touch controller)
+  uint16_t tx, ty;
+  bool touched = tft.getTouch(&tx, &ty);
+  
+  if (touched) {
+    x = tx;
+    y = ty;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Process touch events
+ */
+void processTouchInput() {
+  int x, y;
+  static bool lastTouchState = false;
+  bool currentTouchState = checkTouch(x, y);
+  
+  // Detect touch press (not held)
+  if (currentTouchState && !lastTouchState) {
+    // Start/Stop button
+    if (x >= 10 && x <= 90 && y >= 180 && y <= 220) {
+      if (motorsEnabled) {
+        disableMotors();
+      } else {
+        if (synchronizedMode) {
+          enableSynchronizedMotors();
+        } else {
+          setMotorAxisState(MOTOR_AXIS_0, AXIS_STATE_CLOSED_LOOP_CONTROL);
+          setMotorAxisState(MOTOR_AXIS_1, AXIS_STATE_CLOSED_LOOP_CONTROL);
+          motorsEnabled = true;
+        }
+      }
+    }
+    
+    // Sync button
+    if (x >= 100 && x <= 180 && y >= 180 && y <= 220) {
+      synchronizedMode = !synchronizedMode;
+    }
+    
+    // Emergency Stop button
+    if (x >= 190 && x <= 310 && y >= 180 && y <= 220) {
+      executeEmergencyStop();
+    }
+  }
+  
+  lastTouchState = currentTouchState;
+}
+
+// ===========================
+// Serial Communication
+// ===========================
+
+/**
+ * Process serial commands from PC application
+ */
+void processSerialCommands() {
+  if (Serial.available() >= 13) {
+    uint8_t buffer[13];
+    Serial.readBytes(buffer, 13);
+    
+    // Check for valid packet header (0xAA)
+    if (buffer[0] == 0xAA) {
+      uint8_t cmdType = buffer[1];  // 0xC8 = write, 0xD8 = read
+      uint8_t cmd = buffer[2];
+      uint8_t axis = buffer[3];
+      
+      float value;
+      memcpy(&value, &buffer[4], sizeof(float));
+      
+      // Forward command to CAN bus
+      if (cmdType == 0xC8) {
+        // Write command
+        sendCANCommand(axis, cmd, value);
+      } else if (cmdType == 0xD8) {
+        // Read command - request will be sent, response via CAN
+        sendCANCommand(axis, cmd);
+      }
+    }
+  }
+}
+
+/**
+ * Send telemetry data to PC via serial
+ */
+void sendTelemetryToPC() {
+  if (millis() - lastTelemetryUpdate < TELEMETRY_INTERVAL) return;
+  lastTelemetryUpdate = millis();
+  
+  // Send motor 0 data
+  Serial.write(0xAA);  // Header
+  Serial.write(0xD8);  // Read response
+  Serial.write(CMD_GET_ENCODER_EST);
+  Serial.write(MOTOR_AXIS_0);
+  Serial.write((uint8_t*)&motor0.position, sizeof(float));
+  Serial.write((uint8_t*)&motor0.velocity, sizeof(float));
+  Serial.write(0x85);  // Checksum
+  
+  // Send motor 1 data
+  Serial.write(0xAA);  // Header
+  Serial.write(0xD8);  // Read response
+  Serial.write(CMD_GET_ENCODER_EST);
+  Serial.write(MOTOR_AXIS_1);
+  Serial.write((uint8_t*)&motor1.position, sizeof(float));
+  Serial.write((uint8_t*)&motor1.velocity, sizeof(float));
+  Serial.write(0x85);  // Checksum
+}
+
+// ===========================
+// Setup and Main Loop
+// ===========================
+
+void setup() {
+  Serial.begin(SERIAL_BAUD);
+  Serial.println("ESP32 HMI Starting...");
+  
+  // Initialize TFT display
+  tft.init();
+  tft.setRotation(1);  // Landscape mode
+  tft.fillScreen(TFT_BLACK);
+  
+  // Enable backlight
+  pinMode(TFT_LED, OUTPUT);
+  digitalWrite(TFT_LED, HIGH);
+  
+  // Initialize touch
+  uint16_t calData[5] = { 275, 3620, 264, 3532, 1 };
+  tft.setTouch(calData);
+  
+  // Initialize CAN bus
+  CAN_cfg.speed = CAN_SPEED;
+  CAN_cfg.tx_pin_id = GPIO_NUM_5;
+  CAN_cfg.rx_pin_id = GPIO_NUM_35;
+  CAN_cfg.rx_queue = xQueueCreate(10, sizeof(CAN_frame_t));
+  
+  ESP32Can.CANInit();
+  Serial.println("CAN Bus Initialized");
+  
+  // Display startup screen
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_GREEN);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("DUAL MOTOR", SCREEN_WIDTH/2, SCREEN_HEIGHT/2 - 20);
+  tft.drawString("CONTROL HMI", SCREEN_WIDTH/2, SCREEN_HEIGHT/2 + 10);
+  tft.setTextSize(1);
+  tft.drawString("Ready", SCREEN_WIDTH/2, SCREEN_HEIGHT/2 + 40);
+  
+  delay(2000);
+  
+  Serial.println("System Ready");
+}
+
+void loop() {
+  // Process CAN messages
+  if (millis() - lastCANUpdate >= CAN_UPDATE_INTERVAL) {
+    lastCANUpdate = millis();
+    processCANMessages();
+    
+    // Request telemetry periodically
+    static uint8_t telemetryCounter = 0;
+    if (++telemetryCounter >= 4) {  // Every 200ms
+      telemetryCounter = 0;
+      requestMotorTelemetry(MOTOR_AXIS_0);
+      requestMotorTelemetry(MOTOR_AXIS_1);
+    }
+  }
+  
+  // Process serial commands from PC
+  processSerialCommands();
+  
+  // Send telemetry to PC
+  sendTelemetryToPC();
+  
+  // Process touch input
+  processTouchInput();
+  
+  // Update display
+  updateDisplay();
+  
+  // Emergency stop check
+  if (emergencyStop) {
+    static uint32_t lastBlinkTime = 0;
+    if (millis() - lastBlinkTime > 500) {
+      lastBlinkTime = millis();
+      // Blink display or sound alarm
+    }
+  }
+  
+  delay(10);  // Small delay to prevent watchdog timeout
+}
+
+// ===========================
+// Additional Helper Functions
+// ===========================
+
+/**
+ * Calculate CAN message ID from command and axis
+ */
+uint32_t calculateCANID(uint8_t cmd, uint8_t axis) {
+  return (cmd << 5) | axis;
+}
+
+/**
+ * Convert bytes to float (little endian)
+ */
+float bytesToFloat(uint8_t* bytes) {
+  float value;
+  memcpy(&value, bytes, sizeof(float));
+  return value;
+}
+
+/**
+ * Convert float to bytes (little endian)
+ */
+void floatToBytes(float value, uint8_t* bytes) {
+  memcpy(bytes, &value, sizeof(float));
+}
+
+/*
+ * ===========================
+ * Configuration Notes
+ * ===========================
+ * 
+ * 1. TFT_eSPI Configuration (User_Setup.h):
+ *    - Define ILI9341_DRIVER or ST7789_DRIVER
+ *    - Set correct pins for Elecrow board
+ *    - Enable SPI_FREQUENCY = 40000000
+ * 
+ * 2. CAN Bus Wiring:
+ *    - CAN_TX (GPIO5) -> CAN Transceiver TX
+ *    - CAN_RX (GPIO35) -> CAN Transceiver RX
+ *    - 120Ω termination resistors on both ends
+ * 
+ * 3. Motor Controller Setup:
+ *    - Configure ODrive (or similar) for CAN communication
+ *    - Set axis IDs: Axis 0 = 0x02, Axis 1 = 0x03
+ *    - CAN baud rate: 250 kbps
+ * 
+ * 4. Serial Connection to PC:
+ *    - Baud: 115200
+ *    - Data: 8 bits
+ *    - Parity: None
+ *    - Stop bits: 1
+ * 
+ * 5. Required Libraries:
+ *    - TFT_eSPI: https://github.com/Bodmer/TFT_eSPI
+ *    - ESP32CAN: https://github.com/miwagner/ESP32-Arduino-CAN
+ * 
+ * ===========================
+ */
